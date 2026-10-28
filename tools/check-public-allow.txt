@@ -1,0 +1,3 @@
+# One regex per line; a line matching the regex is not a finding. Optional TAB + glob to scope it.
+# Loopback is documentation, not a host address.
+127\.0\.0\.1

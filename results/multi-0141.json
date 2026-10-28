@@ -1,0 +1,100 @@
+{
+ "schema": 1,
+ "label": "dsv41-zig-0141-multi",
+ "model": "DeepSeek-V4.1-Flash-1017",
+ "url": "http://127.0.0.1:8888",
+ "salt": "e5ba6547",
+ "seed": 1234,
+ "thinking": false,
+ "started": "2026-10-25T19:56:53+0800",
+ "host": "<HEAD_HOST>",
+ "python": "3.12.3",
+ "argv": [
+  "--url",
+  "http://127.0.0.1:8888",
+  "--suite",
+  "multi",
+  "--streams",
+  "1,2,4",
+  "--decode-tokens",
+  "256",
+  "--reps",
+  "1",
+  "--out",
+  "runs/multi-0141.json",
+  "--label",
+  "dsv41-zig-0141-multi"
+ ],
+ "snapshots": {},
+ "runs": [
+  {
+   "suite": "multi",
+   "streams": 1,
+   "rep": 0,
+   "errors": [],
+   "per_stream_decode_tok_s": [
+    56.42938024510991
+   ],
+   "ttft_s": [
+    0.17405552399577573
+   ],
+   "completion_tokens": 256,
+   "window_s": 4.5189225699868985,
+   "aggregate_tok_s": 56.42938024510991,
+   "mean_stream_decode_tok_s": 56.42938024510991,
+   "draft": {}
+  },
+  {
+   "suite": "multi",
+   "streams": 2,
+   "rep": 0,
+   "errors": [],
+   "per_stream_decode_tok_s": [
+    45.41336400887976,
+    45.581238034357995
+   ],
+   "ttft_s": [
+    0.1639536269940436,
+    0.33278322700061835
+   ],
+   "completion_tokens": 512,
+   "window_s": 5.7631390940223355,
+   "aggregate_tok_s": 88.49343937039176,
+   "mean_stream_decode_tok_s": 45.49730102161888,
+   "draft": {}
+  },
+  {
+   "suite": "multi",
+   "streams": 4,
+   "rep": 0,
+   "errors": [],
+   "per_stream_decode_tok_s": [
+    31.525958930954374,
+    28.757081962985776,
+    30.47603250845517,
+    29.203764199773133
+   ],
+   "ttft_s": [
+    0.6698534289898816,
+    0.16625844399095513,
+    0.5015911910159048,
+    0.3341935290081892
+   ],
+   "completion_tokens": 1024,
+   "window_s": 8.899299843003973,
+   "aggregate_tok_s": 114.61575831742032,
+   "mean_stream_decode_tok_s": 29.990709400542112,
+   "draft": {}
+  }
+ ],
+ "summary": {
+  "multi.1.aggregate_tok_s": 56.42938024510991,
+  "multi.1.per_stream_tok_s": 56.42938024510991,
+  "multi.2.aggregate_tok_s": 88.49343937039176,
+  "multi.2.per_stream_tok_s": 45.49730102161888,
+  "multi.4.aggregate_tok_s": 114.61575831742032,
+  "multi.4.per_stream_tok_s": 29.990709400542112,
+  "errors": 0
+ },
+ "finished": "2026-10-25T19:57:13+0800"
+}

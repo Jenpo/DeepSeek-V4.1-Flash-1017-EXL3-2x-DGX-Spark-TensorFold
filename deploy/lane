@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# Serve DeepSeek-V4.1-Flash-1017 (EXL3) on two DGX Sparks with the TensorFold native engine, TP=2.
+#
+#   deploy/lane preflight    check files, RoCE GIDs and ports; change nothing
+#   deploy/lane start        start rank 1 on the worker, then rank 0 here
+#   deploy/lane stop         stop both ranks
+#   deploy/lane status       ask /health, and say what each rank's container is doing
+#   deploy/lane check        one small completion through the API
+#   deploy/lane print        print both docker commands and exit (no side effects)
+#
+# Settings come from config/lane.env (see config/lane.env.example). Anything exported in the
+# environment wins over the file. Placeholders like <WORKER_SSH> make this script refuse to start.
+#
+# Requires: docker with the NVIDIA runtime, passwordless ssh head->worker, the engine built for
+# aarch64/sm_121, and the checkpoint, Engram shards and kernel kit on both nodes.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ROOT="$(dirname "$HERE")"
+ENV_FILE="${LANE_ENV:-$ROOT/config/lane.env}"
+
+log() { printf '[lane] %s\n' "$*"; }
+die() { printf '[lane] %s\n' "$*" >&2; exit 1; }
+
+[[ -f "$ENV_FILE" ]] || die "no $ENV_FILE; copy config/lane.env.example and fill it in"
+set -a; . "$ENV_FILE"; set +a
+
+# ---- settings, with the defaults this lane runs ------------------------------------------------
+NAME="${NAME:-dsv41-zig}"
+WORKER_SSH="${WORKER_SSH:-<WORKER_SSH>}"            # user@worker-link-ip
+HEAD_ADDR="${HEAD_ADDR:-<HEAD_ADDR>}"               # this node's link address (rank 0 listens here)
+HEAD_BIND="${HEAD_BIND:-0.0.0.0}"
+PORT="${PORT:-8888}"
+SERVED_NAME="${SERVED_NAME:-DeepSeek-v4.1-Flash-EXL3}"
+TP_PORT="${TP_PORT:-29620}"
+
+IMAGE="${IMAGE:-<IMAGE>}"
+MODEL_DIR="${MODEL_DIR:-<MODEL_DIR>}"               # EXL3 pack snapshot dir, both nodes
+ENGRAM_DIR="${ENGRAM_DIR:-<ENGRAM_DIR>}"            # shards 47 and 48, both nodes
+RANK_CACHE_DIR="${RANK_CACHE_DIR:-<RANK_CACHE_DIR>}"
+TOKEN_MAP="${TOKEN_MAP:-<TOKEN_MAP>}"
+KIT_DIR="${KIT_DIR:-<KIT_DIR>}"
+ENGINE_DIR="${ENGINE_DIR:-<ENGINE_DIR>}"            # holds tensorfold-native and tf-dsv41-lanes
+SPILL_DIR="${SPILL_DIR:-}"                          # empty: no spill tier
+
+CONTEXT="${CONTEXT:-524288}"
+POOL="${POOL:-1048576}"
+PARALLEL="${PARALLEL:-4}"
+ROUND_ROWS="${ROUND_ROWS:-16}"
+STREAMS="${STREAMS:-$PARALLEL}"
+MAX_TOKENS="${MAX_TOKENS:-32768}"
+THINKING="${THINKING:-1}"
+TEMPERATURE="${TEMPERATURE:-1.0}"
+TOP_P="${TOP_P:-0.95}"
+TOP_K="${TOP_K:-20}"
+DRAFTS="${DRAFTS:-1}"
+GRAPHS="${GRAPHS:-1}"
+REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
+SPILL_GIB="${SPILL_GIB:-0}"
+
+RDMA_DEVICES="${RDMA_DEVICES:-rocep1s0f0,roceP2p1s0f0}"
+RDMA_GID_INDEX="${RDMA_GID_INDEX:-3}"
+SOCKET_IFNAME="${SOCKET_IFNAME:-enp1s0f0np0}"
+RDMA_IDLE_S="${RDMA_IDLE_S:-2}"
+RDMA_NAP_US="${RDMA_NAP_US:-500}"
+
+MIN_AVAIL_GIB="${MIN_AVAIL_GIB:-112}"
+MIN_AVAIL_WAIT_S="${MIN_AVAIL_WAIT_S:-120}"
+READY_TIMEOUT="${READY_TIMEOUT:-2400}"
+EXTRA_ENV="${EXTRA_ENV:-}"
+API_KEY_FILE="${API_KEY_FILE:-}"
+
+# ---- guards ------------------------------------------------------------------------------------
+check_placeholders() {
+  local bad=0 v
+  for v in WORKER_SSH HEAD_ADDR IMAGE MODEL_DIR ENGRAM_DIR RANK_CACHE_DIR TOKEN_MAP KIT_DIR ENGINE_DIR; do
+    if [[ "${!v}" == \<*\> ]]; then log "$v is still a placeholder (${!v})"; bad=1; fi
+  done
+  (( bad == 0 )) || die "refusing: fill config/lane.env first"
+}
+
+ssh_worker() { ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+                    -o ServerAliveCountMax=4 "$WORKER_SSH" "$@"; }
+
+docker_rank0() { docker "$@"; }
+
+# ---- preflight ---------------------------------------------------------------------------------
+preflight() {
+  check_placeholders
+  local ok=0
+
+  log "ssh to the worker"
+  ssh_worker true || { log "cannot ssh to $WORKER_SSH"; ok=1; }
+
+  for f in "$MODEL_DIR/config.json" "$MODEL_DIR/tokenizer.json" "$MODEL_DIR/chat_template.jinja" \
+           "$TOKEN_MAP" "$KIT_DIR/aot/aot.json" "$ENGINE_DIR/tensorfold-native"; do
+    [[ -e "$f" ]] || { log "missing on the head: $f"; ok=1; }
+  done
+  ssh_worker "test -e '$MODEL_DIR/config.json' && test -e '$ENGINE_DIR/tf-dsv41-lanes'" \
+      || { log "missing on the worker: the model dir or tf-dsv41-lanes"; ok=1; }
+
+  log "RoCE GID index $RDMA_GID_INDEX on both nodes (must match NCCL_IB_GID_INDEX)"
+  local head_gid worker_gid
+  head_gid="$(show_gids 2>/dev/null | awk -v i="$RDMA_GID_INDEX" '$3 == i { print $1; exit }' || true)"
+  worker_gid="$(ssh_worker "show_gids 2>/dev/null | awk -v i='$RDMA_GID_INDEX' '\$3 == i { print \$1; exit }'" || true)"
+  [[ -n "$head_gid" ]] || { log "no RoCE GID $RDMA_GID_INDEX on the head (show_gids)"; ok=1; }
+  [[ -n "$worker_gid" ]] || { log "no RoCE GID $RDMA_GID_INDEX on the worker"; ok=1; }
+  [[ -z "$head_gid" || -z "$worker_gid" || "$head_gid" == "$worker_gid" ]] \
+      || { log "GID $RDMA_GID_INDEX is $head_gid on the head but $worker_gid on the worker"; ok=1; }
+
+  log "ports $PORT and $TP_PORT free on both nodes"
+  ss -ltn "( sport = :$PORT or sport = :$TP_PORT )" 2>/dev/null | grep -q LISTEN \
+      && { log "port in use on the head"; ok=1; }
+  ssh_worker "ss -ltn '( sport = :$TP_PORT )' | grep -q LISTEN" \
+      && { log "port $TP_PORT in use on the worker"; ok=1; }
+
+  local avail
+  avail="$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)"
+  (( avail >= MIN_AVAIL_GIB )) || { log "only ${avail} GiB available on the head, ${MIN_AVAIL_GIB} needed"; ok=1; }
+
+  if (( ok )); then die "refusing: preflight found problems"; fi
+  log "preflight: clean"
+}
+
+# ---- commands ----------------------------------------------------------------------------------
+wait_memory() {
+  local waited=0 avail
+  while :; do
+    avail="$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)"
+    (( avail >= MIN_AVAIL_GIB )) && return 0
+    (( waited >= MIN_AVAIL_WAIT_S )) && die "only ${avail} GiB available, ${MIN_AVAIL_GIB} needed; retry in a minute rather than lowering MIN_AVAIL_GIB"
+    log "memory ${avail}/${MIN_AVAIL_GIB} GiB, waiting"
+    sleep 10; waited=$(( waited + 10 ))
+  done
+}
+
+rank1_cmd() {
+  cat <<EOF
+docker run -d --name $NAME --gpus all --ipc=host --network host \\
+  --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK \\
+  --device /dev/infiniband --log-driver json-file --log-opt max-size=100m --log-opt max-file=3 \\
+  -v $MODEL_DIR:/model:ro -v $ENGRAM_DIR:/engram:ro -v $RANK_CACHE_DIR:/rank-cache:ro \\
+  -e TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR -e TF_DS_STREAMS=$STREAMS \\
+  -e TF_RDMA_IDLE_S=$RDMA_IDLE_S -e TF_RDMA_NAP_US=$RDMA_NAP_US \\
+  -e TF_DS_POOL=$POOL -e TF_DS_WINDOW=$CONTEXT \\
+  -e TF_DS_PREFILL_INTERLEAVE_MS=250 -e TF_RDMA_GID_INDEX=$RDMA_GID_INDEX \\
+  -e NCCL_SOCKET_IFNAME=$SOCKET_IFNAME -e NCCL_IB_HCA=$RDMA_DEVICES -e NCCL_IB_GID_INDEX=$RDMA_GID_INDEX \\
+  $EXTRA_ENV $IMAGE \\
+  tf-dsv41-lanes /model /rank-cache 1 2 $HEAD_ADDR $TP_PORT $KIT_DIR \\
+    --engram /engram --token-map $TOKEN_MAP --pool $POOL --streams $STREAMS \\
+    --drafts $DRAFTS --graphs $GRAPHS --side 1 --prefetch 1 --aio 1 --rdma $RDMA_DEVICES
+EOF
+}
+
+rank0_cmd() {
+  local spill_args="" spill_env=""
+  if [[ -n "$SPILL_DIR" ]] && (( SPILL_GIB > 0 )); then
+    spill_args="--spill-dir /spill --spill-gib $SPILL_GIB"
+    spill_env="-v $SPILL_DIR:/spill -e TF_DS_SPILL_DIR=/spill -e TF_DS_SPILL_GIB=$SPILL_GIB"
+  fi
+  cat <<EOF
+docker run -d --name $NAME --gpus all --ipc=host --network host \\
+  --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK \\
+  --device /dev/infiniband --log-driver json-file --log-opt max-size=100m --log-opt max-file=3 \\
+  -v $MODEL_DIR:/model:ro -v $ENGRAM_DIR:/engram:ro -v $RANK_CACHE_DIR:/rank-cache:ro \\
+  -v $KIT_DIR:/kit:ro -v $ENGINE_DIR:/engine:ro $spill_env \\
+  -e TF_TP_WORLD=2 -e TF_TP_MASTER=$HEAD_ADDR -e TF_TP_PORT=$TP_PORT \\
+  -e TF_DS_RANK_CACHE=/rank-cache -e TF_DS_KIT=/kit \\
+  -e TENSORFOLD_CUDA_KERNELS=/kit/aot -e TF_DS_ENGRAM=/engram -e TF_DS_TOKEN_MAP=$TOKEN_MAP \\
+  -e TF_DS_GRAPHS=$GRAPHS -e TF_DS_HC_SIDE=1 -e TF_DS_L2_PREFETCH=1 -e TF_DS_ENGRAM_AIO=1 \\
+  -e TF_RDMA_GID_INDEX=$RDMA_GID_INDEX -e TF_RDMA_DEVICES=$RDMA_DEVICES \\
+  -e TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR -e TF_DS_STREAMS=$STREAMS \\
+  -e TF_RDMA_IDLE_S=$RDMA_IDLE_S -e TF_RDMA_NAP_US=$RDMA_NAP_US \\
+  -e TF_DS_POOL=$POOL -e TF_DS_WINDOW=$CONTEXT \\
+  -e TF_DS_PREFILL_INTERLEAVE_MS=250 \\
+  -e NCCL_SOCKET_IFNAME=$SOCKET_IFNAME -e NCCL_IB_HCA=$RDMA_DEVICES -e NCCL_IB_GID_INDEX=$RDMA_GID_INDEX \\
+  $EXTRA_ENV $IMAGE \\
+  tensorfold-native serve /model --backend cuda --host $HEAD_BIND --port $PORT --name $SERVED_NAME \\
+    --context $CONTEXT --parallel $PARALLEL --round-rows $ROUND_ROWS --max-tokens $MAX_TOKENS \\
+    --temperature $TEMPERATURE --top-p $TOP_P --top-k $TOP_K $( (( THINKING )) && echo --thinking ) \\
+    $spill_args
+EOF
+}
+
+api_key_args() {
+  if [[ -n "$API_KEY_FILE" ]]; then printf -- '-v %s:/api-key:ro -e TENSORFOLD_API_KEY_FILE=/api-key' "$API_KEY_FILE"; fi
+}
+
+start() {
+  check_placeholders
+  if curl -fsS -m 3 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+    log "already serving on port $PORT; nothing started"; return 0
+  fi
+  wait_memory
+  ssh_worker "docker rm -f $NAME >/dev/null 2>&1 || true"
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+  log "rank 1 on $WORKER_SSH"
+  ssh_worker "$(rank1_cmd)"
+  sleep 5
+  log "rank 0 here"
+  eval "$(rank0_cmd)"
+
+  local waited=0
+  while (( waited < READY_TIMEOUT )); do
+    if curl -fsS -m 3 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+      log "ready after ${waited}s on port $PORT"
+      docker logs "$NAME" 2>&1 | grep -m1 'serving:' || true
+      return 0
+    fi
+    sleep 5; waited=$(( waited + 5 ))
+  done
+  docker logs --tail 40 "$NAME" 2>&1 || true
+  die "not ready in ${READY_TIMEOUT}s; see docker logs $NAME"
+}
+
+stop() {
+  log "stopping rank 0 (SIGTERM drains for up to 20 s)"
+  docker stop -t 80 "$NAME" >/dev/null 2>&1 || true
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  ssh_worker "docker stop -t 80 $NAME >/dev/null 2>&1 || true; docker rm -f $NAME >/dev/null 2>&1 || true" || true
+  log "stopped"
+}
+
+status() {
+  local h
+  if h="$(curl -fsS -m 5 "http://127.0.0.1:$PORT/health" 2>/dev/null)"; then
+    printf '%s\n' "$h" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("status:", d.get("status"), "| model:", d.get("model"), "| slots:", d.get("max_batch_size"))
+m=d.get("memory") or {}; l=d.get("live") or {}
+print("memory active GiB:", round((m.get("active") or 0)/2**30, 1), "| live:", l.get("connections"),
+      "| decode tok/s:", l.get("decode_tokens_per_second"))
+'
+  else
+    log "no /health answer on port $PORT"
+  fi
+  docker ps -a --filter "name=$NAME" --format '{{.Names}} {{.Status}}' || true
+  ssh_worker "docker ps -a --filter name=$NAME --format '{{.Names}} {{.Status}}'" || true
+}
+
+check() {
+  curl -fsS -m 120 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$SERVED_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK.\"}],\"max_tokens\":8,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["choices"][0]["message"].get("content"))'
+}
+
+case "${1:-status}" in
+  preflight) preflight ;;
+  start)     start ;;
+  stop)      stop ;;
+  status)    status ;;
+  check)     check ;;
+  print)     printf '=== rank 1 (%s)\n%s\n\n=== rank 0\n%s\n' "$WORKER_SSH" "$(rank1_cmd)" "$(rank0_cmd)" ;;
+  restart)   stop; start ;;
+  *)         sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

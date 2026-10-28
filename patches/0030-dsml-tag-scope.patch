@@ -1,0 +1,242 @@
+From 4803479e8f074f8b95b5f0573ff8bf625efc2ded Mon Sep 17 00:00:00 2001
+From: Manrique <125496885+hashd1ve@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 12:44:35 +0100
+Subject: [PATCH] fix(server): DSML calls are read from their own tags, never
+ moved by <tool_call> text (the native side of #20)
+
+The native parser collected the <tool_call> forms and DeepSeek-V4.1's DSML blocks independently and kept whichever
+started first. A <tool_call> in the prose before a block, with a </tool_call> in one of its arguments (a file being
+written), swallowed the start of the block: the call was dropped and reached the client as text. A call to a tool the
+request did not offer was rewritten as <tool_call>{json}</tool_call>, call syntax the model never wrote. And the call
+streamer read the whole answer, so a Qwen-style <tool_call><function=NAME> quoted in a DSML argument streamed as a real
+call to NAME when that tool was offered, and the reply's DSML calls were then never sent (tool_calls_streamed).
+
+DSML blocks are now found first and the other forms only in the text around them; every invoke is a call, under the
+model's own name when the request did not offer it (with one call a reply, such an invoke drops out as before); the
+streamer is fed beforeDsml(answer), the text before the first DSML block. As 222a9c0b did for the Python server.
+
+Tests: the unoffered-tool case now expects a call; a new test covers a <tool_call> in the prose, a </tool_call> and a
+whole call in an argument, and calls in the reply's order. Both fail before this change.
+---
+ zig/src/server/chat.zig            |  2 +-
+ zig/src/server/tool_parse.zig      | 85 +++++++++++++++---------------
+ zig/src/server/tool_parse_test.zig | 37 +++++++++++--
+ 3 files changed, 77 insertions(+), 47 deletions(-)
+
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index b635b64..cb9edd6 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -400,7 +400,7 @@ const Generation = struct {
+         }
+         if (g.calls) |*c| {
+             var out: std.ArrayList(Value) = .empty;
+-            try c.feed(answer, &out); // never the reasoning: a call it mentions is not made
++            try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
+             for (out.items) |d| try g.emit(sink, d);
+         }
+     }
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index 13db584..5e1d358 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -57,12 +57,44 @@ fn allSpace(s: []const u8) bool {
+ }
+ 
+ /// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it.
++/// The text before the first DSML calls block: a ``<tool_call>`` inside one is an argument's text, not a call.
++pub fn beforeDsml(text: []const u8) []const u8 {
++    const v41 = find(text, dsml41_open, 0) orelse text.len;
++    const v4 = find(text, dsml_open, 0) orelse text.len;
++    return text[0..@min(v41, v4)];
++}
++
++/// A reply's call envelopes in order: DeepSeek-V4.1's DSML blocks first, the other forms only in the text around them.
+ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
+     var found: std.ArrayList(Envelope) = .empty;
++    var gap: usize = 0;
++    var at: usize = 0;
++    while (find(text, dsml41_open, at)) |s| {
++        const e = find(text, dsml41_close, s + dsml41_open.len) orelse break;
++        try tagged(a, text[gap..s], gap, &found);
++        try found.append(a, .{ .start = s, .end = e + dsml41_close.len, .payload = text[s .. e + dsml41_close.len] });
++        at = e + dsml41_close.len;
++        gap = at;
++    }
++    try tagged(a, text[gap..], gap, &found);
++    std.mem.sort(Envelope, found.items, {}, struct {
++        fn less(_: void, x: Envelope, y: Envelope) bool {
++            if (x.start != y.start) return x.start < y.start;
++            if (x.end != y.end) return x.end < y.end;
++            return std.mem.order(u8, x.payload, y.payload) == .lt;
++        }
++    }.less);
++    var kept: std.ArrayList(Envelope) = .empty;
++    for (found.items) |env| if (kept.items.len == 0 or env.start >= kept.items[kept.items.len - 1].end) try kept.append(a, env);
++    return kept.items;
++}
++
++/// The envelopes other than DeepSeek-V4.1's blocks in ``text``, a slice of the reply that starts at ``base``.
++fn tagged(a: Allocator, text: []const u8, base: usize, out: *std.ArrayList(Envelope)) Allocator.Error!void {
+     var pos: usize = 0;
+     while (findCI(text, "<tool_call>", pos)) |s| {
+         const e = findCI(text, "</tool_call>", s + 11) orelse break;
+-        try found.append(a, .{ .start = s, .end = e + 12, .payload = strip(text[s + 11 .. e]) });
++        try out.append(a, .{ .start = base + s, .end = base + e + 12, .payload = strip(text[s + 11 .. e]) });
+         pos = e + 12;
+     }
+     pos = 0;
+@@ -75,37 +107,21 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
+         if (!std.ascii.startsWithIgnoreCase(text[j..], ":tool_call>")) continue;
+         const closer = try std.mem.concat(a, u8, &.{ "</", text[s + 1 .. j], ":tool_call>" });
+         const e = findCI(text, closer, j + 11) orelse continue;
+-        try found.append(a, .{ .start = s, .end = e + closer.len, .payload = strip(text[j + 11 .. e]) });
++        try out.append(a, .{ .start = base + s, .end = base + e + closer.len, .payload = strip(text[j + 11 .. e]) });
+         pos = e + closer.len;
+     }
+     pos = 0;
+     while (find(text, "<|tool_call>", pos)) |s| {
+         const e = find(text, "<tool_call|>", s + 12) orelse break;
+-        try found.append(a, .{ .start = s, .end = e + 12, .payload = strip(text[s + 12 .. e]) });
++        try out.append(a, .{ .start = base + s, .end = base + e + 12, .payload = strip(text[s + 12 .. e]) });
+         pos = e + 12;
+     }
+     pos = 0;
+     while (find(text, dsml_open, pos)) |s| {
+         const e = find(text, dsml_close, s + dsml_open.len) orelse break;
+-        try found.append(a, .{ .start = s, .end = e + dsml_close.len, .payload = text[s .. e + dsml_close.len] });
++        try out.append(a, .{ .start = base + s, .end = base + e + dsml_close.len, .payload = text[s .. e + dsml_close.len] });
+         pos = e + dsml_close.len;
+     }
+-    pos = 0;
+-    while (find(text, dsml41_open, pos)) |s| {
+-        const e = find(text, dsml41_close, s + dsml41_open.len) orelse break;
+-        try found.append(a, .{ .start = s, .end = e + dsml41_close.len, .payload = text[s .. e + dsml41_close.len] });
+-        pos = e + dsml41_close.len;
+-    }
+-    std.mem.sort(Envelope, found.items, {}, struct {
+-        fn less(_: void, x: Envelope, y: Envelope) bool {
+-            if (x.start != y.start) return x.start < y.start;
+-            if (x.end != y.end) return x.end < y.end;
+-            return std.mem.order(u8, x.payload, y.payload) == .lt;
+-        }
+-    }.less);
+-    var kept: std.ArrayList(Envelope) = .empty;
+-    for (found.items) |env| if (kept.items.len == 0 or env.start >= kept.items[kept.items.len - 1].end) try kept.append(a, env);
+-    return kept.items;
+ }
+ 
+ /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
+@@ -129,7 +145,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+         try residue.appendSlice(a, text[cursor..env.start]);
+         cursor = env.end;
+         if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
+-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
++            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls);
+             continue;
+         }
+         if (max_calls) |m| if (calls.items.len >= m) continue;
+@@ -470,12 +486,8 @@ fn gemmaCall(a: Allocator, block: []const u8) Error!?Call {
+     return .{ .name = name, .arguments = try jsonObject(a, .{ .string = text }) };
+ }
+ 
+-/// DeepSeek-V4.1's calls block as the served lane reads it (reply_text.py: dsml_to_tool_calls, then parse_tool_calls on
+-/// each invoke's ``<tool_call>{"name": .., "arguments": ..}</tool_call>``): every ``invoke name="N"`` up to its closer is a
+-/// call of its own, text between them is dropped; its ``parameter name="K"`` values are strings, or JSON with
+-/// ``string="false"`` (a string when that JSON does not parse). An offered name is a call (past ``max_calls`` it is
+-/// dropped; with a limit its arguments must be finite); another name stays as the lane leaves it, its rewritten block.
+-fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value), residue: *std.ArrayList(u8)) Allocator.Error!void {
++/// Each invoke of a DeepSeek-V4.1 calls block as a call; with a limit, only offered tools with finite arguments, up to it.
++fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value)) Allocator.Error!void {
+     var pos: usize = 0;
+     while (find(block, invoke41_open, pos)) |s| {
+         pos = s + 1;
+@@ -484,7 +496,7 @@ fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHas
+         if (q == name_start or !std.mem.startsWith(u8, block[q..], "\">")) continue;
+         const e = find(block, invoke41_close, q + 2) orelse continue;
+         pos = e + invoke41_close.len;
+-        const name = block[name_start..q];
++        const name = strip(block[name_start..q]);
+         const body = block[q + 2 .. e];
+         const arguments = try json.newObject(a);
+         var p: usize = 0;
+@@ -512,21 +524,10 @@ fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHas
+             } else .{ .string = value };
+             try arguments.put(a, body[ns..nq], v);
+         }
+-        if (max_calls) |m| if (calls.items.len >= m) continue;
++        if (name.len == 0) continue;
+         const offered = known.get(try std.ascii.allocLowerString(a, name));
+-        if (offered == null or (max_calls != null and !tool_params.finite(.{ .object = arguments }))) {
+-            if (max_calls == null) {
+-                // the lane's rewrite: <tool_call> + json.dumps({"name": N, "arguments": args}, ensure_ascii=False) + </tool_call>
+-                const doc = try json.newObject(a);
+-                try doc.put(a, "name", .{ .string = name });
+-                try doc.put(a, "arguments", .{ .object = arguments });
+-                try residue.appendSlice(a, "<tool_call>");
+-                try residue.appendSlice(a, try json.stringify(a, .{ .object = doc }, .{ .ascii = false }));
+-                try residue.appendSlice(a, "</tool_call>");
+-            }
+-            continue;
+-        }
+-        try calls.append(a, try openaiCall(a, offered.?, .{ .object = arguments }));
++        if (max_calls) |m| if (calls.items.len >= m or offered == null or !tool_params.finite(.{ .object = arguments })) continue;
++        try calls.append(a, try openaiCall(a, offered orelse name, .{ .object = arguments }));
+     }
+ }
+ 
+diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
+index 5516e48..292c0d0 100644
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -140,14 +140,43 @@ test "DeepSeek-V4.1's DSML calls, read as the served lane reads them" {
+     // JSON that does not parse is the string; no string attribute is a string
+     const loose = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\"weather\"><" ++ D ++ " parameter name=\"x\" string=\"false\">not json</" ++ D ++ " parameter><" ++ D ++ " parameter name=\"y\">7</" ++ D ++ " parameter></" ++ D ++ " invoke></" ++ D ++ " calls>";
+     try std.testing.expectEqualStrings("{\"x\":\"not json\",\"y\":\"7\"}", (try parse(a, loose, tools, null)).calls.?[0].get("function").?.get("arguments").?.string);
+-    // a tool the request did not offer: the lane's rewritten block stays the reply's text
++    // a tool the request did not offer is a call under the model's name, for the client to answer; one call a reply drops it
+     const other = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"launch\">\n<" ++ D ++ " parameter name=\"when\" string=\"true\">now</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+     const kept = try parse(a, other, tools, null);
+-    try std.testing.expect(kept.calls == null);
+-    try std.testing.expectEqualStrings("<tool_call>{\"name\": \"launch\", \"arguments\": {\"when\": \"now\"}}</tool_call>", kept.content);
+-    try std.testing.expectEqualStrings("", (try parse(a, other, tools, 1)).content);
++    try std.testing.expectEqualStrings("", kept.content);
++    try std.testing.expectEqual(@as(usize, 1), kept.calls.?.len);
++    try std.testing.expectEqualStrings("launch", kept.calls.?[0].get("function").?.get("name").?.string);
++    try std.testing.expectEqualStrings("{\"when\":\"now\"}", kept.calls.?[0].get("function").?.get("arguments").?.string);
++    const one = try parse(a, other, tools, 1);
++    try std.testing.expectEqualStrings("", one.content);
++    try std.testing.expect(one.calls == null);
+     // a block with no invoke goes; an unclosed block stays text
+     try std.testing.expectEqualStrings("Hi.", (try parse(a, "Hi.<" ++ D ++ " calls>\n</" ++ D ++ " calls>", tools, null)).content);
+     const open = "Hi.<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"weather\">";
+     try std.testing.expectEqualStrings(open, (try parse(a, open, tools, null)).content);
+ }
++
++test "a DSML block is read from its own tags: <tool_call> text around it or in an argument moves nothing" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"weather\"}},{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
++    const D = "\u{ff5c}DSML\u{ff5c}";
++    const quoted = "a </tool_call> and <tool_call>{\"name\": \"weather\", \"arguments\": {}}</tool_call>";
++    const block = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"write\">\n<" ++ D ++ " parameter name=\"content\" string=\"true\">" ++ quoted ++ "</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
++    // a <tool_call> in the prose before the block, and a </tool_call> and a whole call in its argument
++    const r = try parse(a, "I will not use <tool_call> here.\n\n" ++ block, tools, null);
++    try std.testing.expectEqualStrings("I will not use <tool_call> here.", r.content);
++    try std.testing.expectEqual(@as(usize, 1), r.calls.?.len);
++    try std.testing.expectEqualStrings("write", r.calls.?[0].get("function").?.get("name").?.string);
++    const args = (try json.parse(a, r.calls.?[0].get("function").?.get("arguments").?.string)).ok;
++    try std.testing.expectEqualStrings(quoted, args.get("content").?.string);
++    // calls keep the reply's order: a <tool_call> call before the block comes first
++    const both = try parse(a, "<tool_call>{\"name\": \"weather\", \"arguments\": {\"city\": \"Oslo\"}}</tool_call>\n" ++ block, tools, null);
++    try std.testing.expectEqual(@as(usize, 2), both.calls.?.len);
++    try std.testing.expectEqualStrings("weather", both.calls.?[0].get("function").?.get("name").?.string);
++    try std.testing.expectEqualStrings("write", both.calls.?[1].get("function").?.get("name").?.string);
++    // the call streamer reads only the text before the first block
++    try std.testing.expectEqualStrings("Hi. ", tool_parse.beforeDsml("Hi. " ++ block ++ " more"));
++    try std.testing.expectEqualStrings("no block", tool_parse.beforeDsml("no block"));
++}
+-- 
+2.55.0
+

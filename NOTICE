@@ -1,0 +1,15 @@
+DeepSeek-V4.1-Flash-1017 EXL3 on 2x DGX Spark
+Copyright 2026
+
+This repository's scripts, documents, tools and patch files are licensed under the Apache License,
+Version 2.0 (LICENSE).
+
+The files in patches/ are modifications of TensorFold (https://github.com/ashhart/TensorFold), as forked
+by bertholomus (https://github.com/bertholomus/TensorFold), at revision
+629c524a0ea57512a5342abb498d1b7c25353343 (branch deepseek-v41-zig). TensorFold is licensed under the
+Apache License, Version 2.0; its LICENSE and NOTICE travel with the engine checkout, not with this
+repository. Each patch states the files it changes and why (Apache License 2.0, section 4(b)), and keeps
+its original author and date in the file header.
+
+Model weights and Engram tables are not distributed here. See CREDITS.md for every project this build
+relies on, and docs/LICENSING.md for the licence of each component.
