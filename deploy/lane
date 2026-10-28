@@ -42,6 +42,8 @@ TOKEN_MAP="${TOKEN_MAP:-CHANGE-ME-token_map}"
 KIT_DIR="${KIT_DIR:-CHANGE-ME-kit_dir}"
 ENGINE_DIR="${ENGINE_DIR:-CHANGE-ME-engine_dir}"            # holds tensorfold-native and tf-dsv41-lanes
 SPILL_DIR="${SPILL_DIR:-}"                          # empty: no spill tier
+SPILL_MIN_FREE_GIB="${SPILL_MIN_FREE_GIB:-50}"      # engine default 50; never below the memory floor
+SPILL_MIN_TOKENS="${SPILL_MIN_TOKENS:-8192}"        # engine default 8192
 
 CONTEXT="${CONTEXT:-524288}"
 POOL="${POOL:-1048576}"
@@ -155,7 +157,7 @@ EOF
 rank0_cmd() {
   local spill_args="" spill_env=""
   if [[ -n "$SPILL_DIR" ]] && (( SPILL_GIB > 0 )); then
-    spill_args="--spill-dir /spill --spill-gib $SPILL_GIB"
+    spill_args="--spill-dir /spill --spill-gib $SPILL_GIB --spill-min-free-gib $SPILL_MIN_FREE_GIB --spill-min-tokens $SPILL_MIN_TOKENS"
     spill_env="-v $SPILL_DIR:/spill -e TF_DS_SPILL_DIR=/spill -e TF_DS_SPILL_GIB=$SPILL_GIB"
   fi
   cat <<EOF

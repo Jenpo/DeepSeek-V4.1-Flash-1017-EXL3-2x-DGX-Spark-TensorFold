@@ -88,10 +88,65 @@ only, no leaked markup).
 
 3. **Kit.** Fetch the kernel kit at the pinned revision and verify it against its `MANIFEST`.
 4. **Config.** `cp config/lane.env.example config/lane.env` and fill in the node addresses, paths and
-   the RoCE device names for your pair. Placeholders (`<...>`) make `deploy/lane` refuse to start.
+   the RoCE device names for your pair. Every value still reading `CHANGE-ME-*` makes `deploy/lane`
+   refuse to start, and `preflight` lists the ones you missed.
 5. **Start.** `deploy/lane preflight` then `deploy/lane start`. First start writes the rank caches
    (~93 GB per node) and the token map; expect 20+ minutes for that on a cold cache.
 6. **Check.** `deploy/lane check` sends one small completion and prints the model's answer.
+
+## The parameters we actually run
+
+`deploy/lane print` prints the two `docker run` lines below with your `config/lane.env` substituted.
+This is the production lane on spark-001/spark-002 as of 2026-10-28 — not a suggested starting point,
+the values the measured numbers in this README were taken with. Anything not listed keeps its
+engine default.
+
+**rank 0 (head, `spark-001`)** — serves the API:
+
+```
+tensorfold-native serve /model --backend cuda --host 0.0.0.0 --port 8888 \
+  --name DeepSeek-v4.1-Flash-EXL3 --context 524288 --parallel 4 --round-rows 16 \
+  --max-tokens 32768 --temperature 1.0 --top-p 0.95 --top-k 20 --thinking \
+  --spill-dir /spill --spill-gib 64 --spill-min-free-gib 50 --spill-min-tokens 8192
+```
+
+**rank 1 (worker, `spark-002`)** — holds the second half of the weights, no listener:
+
+```
+tf-dsv41-lanes /model /rank-cache 1 2 <HEAD_ADDR> 29620 /kit \
+  --engram /engram --token-map /token-map/dsv41_token_map.json \
+  --pool 1048576 --streams 4 --drafts 1 --graphs 1 --side 1 --prefetch 1 --aio 1 \
+  --rdma rocep1s0f0,roceP2p1s0f0
+```
+
+**environment**, both ranks (`-e` on the container; the script sets these from `config/lane.env`):
+
+| variable | value | why |
+| --- | --- | --- |
+| `TF_TP_WORLD` | 2 | two ranks, TP=2 |
+| `TF_TP_MASTER` / `TF_TP_PORT` | head link address / 29620 | rank 1 rendezvouses here |
+| `TF_RDMA_DEVICES` | `rocep1s0f0,roceP2p1s0f0` | both ConnectX-7 rails; one rail costs 8.7 % on a 125K cold prefill (`docs/RAILS.md`) |
+| `TF_RDMA_GID_INDEX` | 3 | must match `NCCL_IB_GID_INDEX`; verify with `show_gids` |
+| `TF_RDMA_IDLE_S` / `TF_RDMA_NAP_US` | 2 / 500 | how long a quiet rail sleeps, and for how long per nap |
+| `TF_DS_POOL` | 1048576 | shared KV pool, tokens across all slots |
+| `TF_DS_WINDOW` | 524288 | per-request ceiling; a head with nothing else on it can run 1048576 |
+| `TF_DS_STREAMS` | 4 | equals `--parallel` |
+| `TF_DS_REPLAY_FLOOR` | 1 | keeps the last round replayable across a prompt-cache hit |
+| `TF_DS_GRAPHS` | 1 | CUDA graphs for the decode round |
+| `TF_DS_HC_SIDE` | 1 | side-stream hyper-connections |
+| `TF_DS_L2_PREFETCH` | 1 | L2 prefetch of the next layer's weights |
+| `TF_DS_ENGRAM_AIO` | 1 | io_uring reads for Engram rows instead of the thread pool |
+| `TF_DS_PREFILL_INTERLEAVE_MS` | 250 | decode slices interleaved into a long prefill |
+| `TENSORFOLD_CUDA_KERNELS` | `/kit/aot` | the 16-row AOT kit |
+| `NCCL_SOCKET_IFNAME` | `enp1s0f0np0` | the link interface |
+| `NCCL_IB_HCA` / `NCCL_IB_GID_INDEX` | same as the RDMA pair above | NCCL must pick the same rails and GID |
+| `TENSORFOLD_MEMORY_RESERVE_GIB` | 12.2 (engine default) | **do not lower** (`docs/MEMORY.md`) |
+
+**why these and not the neighbours**: `--round-rows 16` because the pinned kit has 16-row kernels
+(`docs/TUNING.md` §1–2); `--top-k 20` because 0 or -1 is a request-killer on this pin (§5);
+`--context 524288` with `POOL 1048576` because the pool outlives any single request;
+`--spill-gib 64` with `--spill-min-free-gib 50` so a spill can never start below the memory floor
+(`docs/MEMORY.md`). Each of these has a section explaining the measurement behind it.
 
 ## Operating notes
 
