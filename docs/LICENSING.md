@@ -15,7 +15,12 @@
 - Nothing here redistributes weights, the kit's binaries, or engine source. `deploy/` points at a
   checkpoint you download yourself; `patches/` are diffs against a commit you clone yourself.
 - TensorFold's LICENSE and NOTICE travel with the engine checkout, not with this repository.
-- Several patches originate from the MiaAI-Lab recipe, which is Apache-2.0; each patch keeps its
+- Several patches originate from MiaAI-Lab recipes, which are Apache-2.0; each patch keeps its
   original author and date in the file header. `CREDITS.md` lists everyone by name.
+- MiaAI-Lab publishes more than one recipe, under different licences. The two this repository draws
+  from — `GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold` and `DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks` —
+  are both Apache-2.0 (checked against the GitHub licence API, 2026-10-28). Their **EXL3** two-node kit
+  `DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks` is AGPL-3.0 and is not used here in any form: this lane is
+  the Zig engine, and no file in `patches/`, `tools/` or `docs/` derives from that repository.
 - Some recipes in this space carry AGPL-3.0 components (abliteration tooling, for instance). This lane
   runs none of them: `ABLIT=0` in `config/lane.env.example`.

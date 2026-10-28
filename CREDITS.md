@@ -18,7 +18,8 @@ This lane stands on other people's work. Named here by role.
 ## Fixes we carry
 
 - **MiaAI-Lab** — the two-node recipe the patch series is ported from, and the GLM-5.3-Flash recipe that
-  several of those patches originally came from.
+  several of those patches originally came from. Both are Apache-2.0. MiaAI-Lab's *EXL3* two-node kit
+  (`DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks`) is AGPL-3.0 and is **not** used anywhere in this repository.
 - **Robert Wojciechowski** — the port series (`0011`–`0022`).
 - **Coinupbtc** — prefill interleave (`0005`, upstream PR #5), tool-call prose (`0027`), plain request
   text (`0028`).
@@ -27,6 +28,12 @@ This lane stands on other people's work. Named here by role.
   Engram AIO leak (`0033`, `12132870b`), plus the two-rail and copy-window measurements this repository's
   `docs/RAILS.md` and `docs/TUNING.md` cite.
 - **jayleaton** — the classic-line recipe whose knob tables and memory-floor discipline shaped `docs/MEMORY.md`.
+- **x00byte** — the `LibertAIDAI` 2.9 bpw dual-Spark recipe on the Python engine: the eight-slot
+  1,048,576-token pool shape and the effort-75 tuning comparison that corroborate `docs/TUNING.md`'s
+  pool and effort findings from an independent build of the same checkpoint.
+- **sfxnz** — the EXL3 vLLM recipe's lever-by-lever A/B record. Its measured refutations of several
+  widely-copied levers are independent evidence for `docs/TUNING.md` §3: knobs that pay off on one
+  engine's kernel stack are inert or negative on another, so a knob name is not a portable finding.
 - **tonyd2wild** — the GB10 clock-latch diagnosis reproduced in `docs/GPU-CLOCK.md`, and the fleet
   measurements that first showed this pack's ceiling.
 - **lucataco**, **swbiggart**, **mrsergiopascal**, **willjriley**, **nmcbride**, **LeetJoe**,
