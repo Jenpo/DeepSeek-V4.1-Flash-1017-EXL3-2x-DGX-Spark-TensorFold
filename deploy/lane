@@ -9,7 +9,7 @@
 #   deploy/lane print        print both docker commands and exit (no side effects)
 #
 # Settings come from config/lane.env (see config/lane.env.example). Anything exported in the
-# environment wins over the file. Placeholders like <WORKER_SSH> make this script refuse to start.
+# environment wins over the file. Values left at CHANGE-ME-... make this script refuse to start.
 #
 # Requires: docker with the NVIDIA runtime, passwordless ssh head->worker, the engine built for
 # aarch64/sm_121, and the checkpoint, Engram shards and kernel kit on both nodes.
@@ -27,20 +27,20 @@ set -a; . "$ENV_FILE"; set +a
 
 # ---- settings, with the defaults this lane runs ------------------------------------------------
 NAME="${NAME:-dsv41-zig}"
-WORKER_SSH="${WORKER_SSH:-<WORKER_SSH>}"            # user@worker-link-ip
-HEAD_ADDR="${HEAD_ADDR:-<HEAD_ADDR>}"               # this node's link address (rank 0 listens here)
+WORKER_SSH="${WORKER_SSH:-CHANGE-ME-worker}"         # user@worker-link-ip
+HEAD_ADDR="${HEAD_ADDR:-CHANGE-ME-head}"             # this node's link address (rank 0 listens here)
 HEAD_BIND="${HEAD_BIND:-0.0.0.0}"
 PORT="${PORT:-8888}"
 SERVED_NAME="${SERVED_NAME:-DeepSeek-v4.1-Flash-EXL3}"
 TP_PORT="${TP_PORT:-29620}"
 
-IMAGE="${IMAGE:-<IMAGE>}"
-MODEL_DIR="${MODEL_DIR:-<MODEL_DIR>}"               # EXL3 pack snapshot dir, both nodes
-ENGRAM_DIR="${ENGRAM_DIR:-<ENGRAM_DIR>}"            # shards 47 and 48, both nodes
-RANK_CACHE_DIR="${RANK_CACHE_DIR:-<RANK_CACHE_DIR>}"
-TOKEN_MAP="${TOKEN_MAP:-<TOKEN_MAP>}"
-KIT_DIR="${KIT_DIR:-<KIT_DIR>}"
-ENGINE_DIR="${ENGINE_DIR:-<ENGINE_DIR>}"            # holds tensorfold-native and tf-dsv41-lanes
+IMAGE="${IMAGE:-CHANGE-ME-image}"
+MODEL_DIR="${MODEL_DIR:-CHANGE-ME-model_dir}"               # EXL3 pack snapshot dir, both nodes
+ENGRAM_DIR="${ENGRAM_DIR:-CHANGE-ME-engram_dir}"            # shards 47 and 48, both nodes
+RANK_CACHE_DIR="${RANK_CACHE_DIR:-CHANGE-ME-rank_cache_dir}"
+TOKEN_MAP="${TOKEN_MAP:-CHANGE-ME-token_map}"
+KIT_DIR="${KIT_DIR:-CHANGE-ME-kit_dir}"
+ENGINE_DIR="${ENGINE_DIR:-CHANGE-ME-engine_dir}"            # holds tensorfold-native and tf-dsv41-lanes
 SPILL_DIR="${SPILL_DIR:-}"                          # empty: no spill tier
 
 CONTEXT="${CONTEXT:-524288}"
@@ -74,7 +74,7 @@ API_KEY_FILE="${API_KEY_FILE:-}"
 check_placeholders() {
   local bad=0 v
   for v in WORKER_SSH HEAD_ADDR IMAGE MODEL_DIR ENGRAM_DIR RANK_CACHE_DIR TOKEN_MAP KIT_DIR ENGINE_DIR; do
-    if [[ "${!v}" == \<*\> ]]; then log "$v is still a placeholder (${!v})"; bad=1; fi
+    if [[ "${!v}" == CHANGE-ME-* ]]; then log "$v is still a placeholder (${!v})"; bad=1; fi
   done
   (( bad == 0 )) || die "refusing: fill config/lane.env first"
 }
